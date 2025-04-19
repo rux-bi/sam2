@@ -296,7 +296,7 @@ class SAM2ImagePredictor:
             multimask_output,
             return_logits=return_logits,
         )
-
+        import pdb; pdb.set_trace()
         masks_np = masks.squeeze(0).float().detach().cpu().numpy()
         iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
         low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
