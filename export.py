@@ -22,48 +22,21 @@ class SAM2FullModel(torch.nn.Module):
         self.norm_mean = nn.Parameter(torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1), requires_grad=False)
         self.norm_std = nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1), requires_grad=False)
         self.target_size = (1024, 1024)
-        
-        # Create a custom resize operation that's TensorRT compatible
-        # We'll use a combination of padding and interpolation for better quality
-        self.pad_mode = 'reflect'  # Options: 'constant', 'reflect', 'replicate'
+        self.resize_op = Resize(self.target_size)
         
     def _resize_with_pad(self, x):
         """Custom resize operation that preserves aspect ratio with padding"""
         # Get current dimensions
-        _, _, h, w = x.shape
-        target_h, target_w = self.target_size
-        
-        # Calculate scaling factor to preserve aspect ratio
-        scale = min(target_h / h, target_w / w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        
-        # Resize with interpolation (TensorRT compatible)
-        resized = torch.nn.functional.interpolate(
-            x, size=(new_h, new_w), mode='bilinear', align_corners=False
+        return torch.nn.functional.interpolate(
+            x, self.target_size, mode='bilinear', align_corners=True
         )
-        
-        # Calculate padding
-        pad_h = target_h - new_h
-        pad_w = target_w - new_w
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-        
-        # Apply padding (TensorRT compatible)
-        padded = torch.nn.functional.pad(
-            resized, (pad_left, pad_right, pad_top, pad_bottom), 
-            mode=self.pad_mode
-        )
-        
-        return padded
 
     def forward(self, image, boxes):
-        # Use our custom resize function
-        resized_image = self._resize_with_pad(image)
-        
-        # Apply normalization
-        backbone_out = self.model.forward_image((resized_image - self.norm_mean) / self.norm_std)
+        # Resize should be taken out of the forward function because it's not working in TensorRT
+        # resized_image = self._resize_with_pad(image)
+        # # Apply normalization
+        backbone_out = self.model.forward_image((image - self.norm_mean) / self.norm_std)
+        # backbone_out = self.model.forward_image(image)
         _, vision_feats, _, _ = self.model._prepare_backbone_features(backbone_out)
 
         if self.model.directly_add_no_mem_embed:
@@ -92,7 +65,7 @@ class SAM2FullModel(torch.nn.Module):
         )
         return low_res_masks, iou_predictions
 
-def preprocess_inputs(image, predictor, boxes=None):
+def preprocess_boxes(image, predictor, boxes=None):
     w, h = image.size
     orig_hw = [(h, w)]
     boxes = torch.as_tensor(boxes, dtype=torch.float, device='cuda')
@@ -101,6 +74,16 @@ def preprocess_inputs(image, predictor, boxes=None):
     )  # Bx2x2
     return unnorm_box
 
+def preprocess_inputs(image, predictor, boxes=None):
+    w, h = image.size
+    orig_hw = [(h, w)]
+    input_image = predictor._transforms(image)
+    input_image = input_image[None, ...].to('cuda')
+    boxes = torch.as_tensor(boxes, dtype=torch.float, device='cuda')
+    unnorm_box = predictor._transforms.transform_boxes(
+        boxes, normalize=True, orig_hw=orig_hw[0]
+    )  # Bx2x2
+    return input_image, unnorm_box
 
 def postprocess_masks(out, predictor, image):
     """Postprocess low-resolution masks and convert them for visualization."""
@@ -182,8 +165,12 @@ with torch.no_grad():
     sam_model = SAM2FullModel(encoder)
     sam_model.eval().cuda()
     
-    processed_boxes = preprocess_inputs(input_image, predictor, boxes)
+    processed_boxes = preprocess_boxes(input_image, predictor, boxes)
+    image_tensor = torch.nn.functional.interpolate(
+        image_tensor, (1024, 1024), mode='bilinear', align_corners=True
+    )
     torchtrt_inputs = (image_tensor, processed_boxes)
+    # torchtrt_inputs = preprocess_inputs(input_image, predictor, boxes)
     input_names = ["input_image", "boxes"]
     if generate_onnx:
         outputs = sam_model(*torchtrt_inputs)
@@ -238,19 +225,12 @@ sess_opt.log_severity_level = 0
 sess = ort.InferenceSession(onnx_path, providers=providers, sess_options=sess_opt)
 io_binding = sess.io_binding()
 device_type = "cuda"
-# binded_low_res_masks = torch.zeros((1, 1, 1024, 1024), dtype=torch.float32, device='cuda')
-# binded_iou_predictions = torch.zeros((1, 1, 1024, 1024), dtype=torch.float32, device='cuda')
-# binded_boxes  = torch.zeros((model.num_queries, 4), dtype=torch.float32, device='cuda')
-# binded_num_dets = torch.zeros((1,), dtype=torch.int64, device='cuda')
-# binded_max_conf = torch.zeros((model.num_queries,), dtype=torch.float32, device='cuda')
+
 binded_low_res_masks = torch.zeros_like(outputs[0])
 binded_iou_predictions = torch.zeros_like(outputs[1])
 io_binding.bind_input(name='input_image', device_type=device_type, device_id=0, element_type=np.float32, shape=torchtrt_inputs[0].shape, buffer_ptr=torchtrt_inputs[0].data_ptr())
-if use_box:
-    io_binding.bind_input(name='boxes', device_type=device_type, device_id=0, element_type=np.float32, shape=torchtrt_inputs[1].shape, buffer_ptr=torchtrt_inputs[1].data_ptr())
-else:
-    io_binding.bind_input(name='point_coords', device_type=device_type, device_id=0, element_type=np.float32, shape=torchtrt_inputs[1].shape, buffer_ptr=torchtrt_inputs[1].data_ptr())
-    io_binding.bind_input(name='point_labels', device_type=device_type, device_id=0, element_type=np.int32, shape=torchtrt_inputs[2].shape, buffer_ptr=torchtrt_inputs[2].data_ptr())
+io_binding.bind_input(name='boxes', device_type=device_type, device_id=0, element_type=np.float32, shape=torchtrt_inputs[1].shape, buffer_ptr=torchtrt_inputs[1].data_ptr())
+
 io_binding.bind_output(name='low_res_masks', device_type=device_type, device_id=0, element_type=np.float32, shape=binded_low_res_masks.shape, buffer_ptr=binded_low_res_masks.data_ptr())
 io_binding.bind_output(name='iou_predictions', device_type=device_type, device_id=0, element_type=np.float32, shape=binded_iou_predictions.shape, buffer_ptr=binded_iou_predictions.data_ptr())
 with torch.no_grad():
