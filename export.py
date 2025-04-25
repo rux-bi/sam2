@@ -21,17 +21,20 @@ class SAM2FullModel(torch.nn.Module):
         self._bb_feat_sizes = [(256, 256), (128, 128), (64, 64)]
         self.norm_mean = nn.Parameter(torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1), requires_grad=False)
         self.norm_std = nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1), requires_grad=False)
-        self.target_size = (1024, 1024)
-        self.resize_op = Resize(self.target_size)
-        
-    def _resize_with_pad(self, x):
-        """Custom resize operation that preserves aspect ratio with padding"""
-        # Get current dimensions
-        return torch.nn.functional.interpolate(
-            x, self.target_size, mode='bilinear', align_corners=True
-        )
+        self.resolution = 1024
+        self.max_boxes = 15
 
-    def forward(self, image, boxes):
+    def _preprocess_boxes(self, boxes, orig_hw):
+        coords = boxes.reshape(-1, 2, 2) / orig_hw.flip(0) * self.resolution
+        # expand boxes from nx2x2 to 30x2x2
+        boxes_expanded = torch.zeros((self.max_boxes, 2, 2), device=boxes.device)
+        num_boxes = min(coords.shape[0], self.max_boxes)
+        boxes_expanded[:num_boxes, :, :] = coords
+        box_labels = torch.tensor([[2, 3]], dtype=torch.int, device=boxes.device)
+        box_labels = box_labels.repeat(self.max_boxes, 1)
+        return boxes_expanded, box_labels
+    
+    def forward(self, image, boxes, orig_hw):
         # Resize should be taken out of the forward function because it's not working in TensorRT
         # resized_image = self._resize_with_pad(image)
         # # Apply normalization
@@ -51,8 +54,9 @@ class SAM2FullModel(torch.nn.Module):
         high_res_features = [
             feat_level[-1].unsqueeze(0) for feat_level in features["high_res_feats"]
         ]
+        coords = self._preprocess_boxes(boxes, orig_hw)
         sparse_embeddings, dense_embeddings = self.model.sam_prompt_encoder(
-            points=None, boxes=boxes, masks=None
+            points=coords, boxes=None, masks=None
         )
         low_res_masks, iou_predictions, _, _ = self.model.sam_mask_decoder(
             image_embeddings=features["image_embed"][-1].unsqueeze(0),
@@ -60,37 +64,18 @@ class SAM2FullModel(torch.nn.Module):
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=False,
-            repeat_image=boxes.shape[0] > 1,
+            repeat_image=True,
             high_res_features=high_res_features,
         )
-        return low_res_masks, iou_predictions
+        return low_res_masks, iou_predictions, torch.tensor([(coords[0][:,0, 0] > 0).sum()], dtype=torch.int64, device=low_res_masks.device).reshape(1, 1)
 
-def preprocess_boxes(image, predictor, boxes=None):
-    w, h = image.size
-    orig_hw = [(h, w)]
-    boxes = torch.as_tensor(boxes, dtype=torch.float, device='cuda')
-    unnorm_box = predictor._transforms.transform_boxes(
-        boxes, normalize=True, orig_hw=orig_hw[0]
-    )  # Bx2x2
-    return unnorm_box
 
-def preprocess_inputs(image, predictor, boxes=None):
-    w, h = image.size
-    orig_hw = [(h, w)]
-    input_image = predictor._transforms(image)
-    input_image = input_image[None, ...].to('cuda')
-    boxes = torch.as_tensor(boxes, dtype=torch.float, device='cuda')
-    unnorm_box = predictor._transforms.transform_boxes(
-        boxes, normalize=True, orig_hw=orig_hw[0]
-    )  # Bx2x2
-    return input_image, unnorm_box
-
-def postprocess_masks(out, predictor, image):
+def postprocess_masks(out, image, num_boxes):
     """Postprocess low-resolution masks and convert them for visualization."""
     orig_hw = (image.size[1], image.size[0])  # (height, width)
-    masks = predictor._transforms.postprocess_masks(out[0], orig_hw)
+    masks = torch.nn.functional.interpolate(out[0][:num_boxes], orig_hw, mode='bilinear', align_corners=False)
     masks = (masks > 0.0).squeeze(0).cpu().numpy()
-    scores = out[1].squeeze(0).cpu().numpy()
+    scores = out[1][:num_boxes].squeeze(0).cpu().numpy()
     return masks, scores
 
 
@@ -147,13 +132,13 @@ input_image = Image.open("./notebooks/images/truck.jpg").convert("RGB")
 image = np.array(input_image).astype(np.float32) / 255.0
 image = image.transpose(2, 0, 1)
 image_tensor = torch.from_numpy(image).unsqueeze(0).cuda()
+orig_hw = torch.tensor(image_tensor.shape[2:], dtype=torch.int32, device='cuda')
 boxes = np.array([
     [75, 275, 1725, 850],
     [425, 600, 700, 875],
     [1375, 550, 1650, 800],
     [1240, 675, 1400, 750],
 ])
-boxes_tensor = torch.from_numpy(boxes).cuda()
 use_box = True
 generate_onnx = True
 with torch.no_grad():
@@ -164,29 +149,28 @@ with torch.no_grad():
     encoder = predictor.model.eval().cuda()
     sam_model = SAM2FullModel(encoder)
     sam_model.eval().cuda()
-    
-    processed_boxes = preprocess_boxes(input_image, predictor, boxes)
-    image_tensor = torch.nn.functional.interpolate(
+    boxes_tensor = torch.as_tensor(boxes, dtype=torch.float, device='cuda')
+    input_image_tensor = torch.nn.functional.interpolate(
         image_tensor, (1024, 1024), mode='bilinear', align_corners=True
     )
-    torchtrt_inputs = (image_tensor, processed_boxes)
-    # torchtrt_inputs = preprocess_inputs(input_image, predictor, boxes)
-    input_names = ["input_image", "boxes"]
+    torchtrt_inputs = (input_image_tensor, boxes_tensor, orig_hw)
+    input_names = ["img", "boxes", "orig_hw"]
     if generate_onnx:
         outputs = sam_model(*torchtrt_inputs)
-        masks, scores = postprocess_masks(outputs, predictor, input_image)
+        masks, scores = postprocess_masks(outputs, input_image, boxes.shape[0])
         plt.figure(figsize=(10, 10))
         plt.imshow(input_image)
         for mask in masks:
-            show_mask(mask.squeeze(0), plt.gca(), random_color=True, borders=False)
+            show_mask(mask.squeeze(0), plt.gca(), random_color=True, borders=True)
         for box in boxes:
             show_box(box, plt.gca())
         plt.axis('off')
         plt.show()
         # show_masks(input_image, masks, scores, point_coords=None, box_coords=boxes, input_labels=None, borders=False)
-
         print("Starting ONNX export...")
-        # Try with a much lower opset version
+        dynamic_axes={
+            "boxes": {0: "num_boxes"},
+        }
         torch.onnx.export(
             sam_model,
             f=onnx_path,
@@ -194,7 +178,7 @@ with torch.no_grad():
             input_names=input_names,
             output_names=["low_res_masks", "iou_predictions"],
             do_constant_folding=True,
-            dynamic_axes=None,
+            dynamic_axes=dynamic_axes,
             export_params=True,
             opset_version=20,  # Try a much lower opset version
             training=torch.onnx.TrainingMode.EVAL,
@@ -206,15 +190,17 @@ with torch.no_grad():
 
 ################# TRT Export ##################
 trt_cache_path = "/offboard/sam2/assets/trt_cache"
+trt_engine_name = "sam2_1_hiera_large_trt_fp16.engine"
 providers = [
     ('TensorrtExecutionProvider', {
         'device_id': 0,                     # Select GPU to execute
         "trt_engine_cache_enable": True,
+        # 'trt_engine_cache_path': f"{trt_cache_path}/{trt_engine_name}",
         'trt_engine_cache_path': trt_cache_path,
         'trt_fp16_enable': True,              # Enable FP16 precision for faster inference  
-        # 'trt_profile_opt_shapes': f"input_ids:1x{seq_len},attention_mask:1x{seq_len},position_ids:1x{seq_len},token_type_ids:1x{seq_len},text_token_mask:1x{seq_len}x{seq_len}",
-        # 'trt_profile_min_shapes': "input_ids:1x1,attention_mask:1x1,position_ids:1x1,token_type_ids:1x1,text_token_mask:1x1x1",
-        # 'trt_profile_max_shapes': "input_ids:1x256,attention_mask:1x256,position_ids:1x256,token_type_ids:1x256,text_token_mask:1x256x256",
+        'trt_profile_opt_shapes': "boxes:4x4,img:1x3x1024x1024,orig_hw:2",
+        'trt_profile_min_shapes': "boxes:1x4,img:1x3x1024x1024,orig_hw:2",
+        'trt_profile_max_shapes': "boxes:15x4,img:1x3x1024x1024,orig_hw:2",
         # 'trt_layer_norm_fp32_fallback': True, 
     }),
 ]
@@ -224,13 +210,12 @@ sess_opt = ort.SessionOptions()
 sess_opt.log_severity_level = 0
 sess = ort.InferenceSession(onnx_path, providers=providers, sess_options=sess_opt)
 io_binding = sess.io_binding()
-device_type = "cuda"
-
+device_type = torchtrt_inputs[0].device.type
 binded_low_res_masks = torch.zeros_like(outputs[0])
 binded_iou_predictions = torch.zeros_like(outputs[1])
-io_binding.bind_input(name='input_image', device_type=device_type, device_id=0, element_type=np.float32, shape=torchtrt_inputs[0].shape, buffer_ptr=torchtrt_inputs[0].data_ptr())
+io_binding.bind_input(name='img', device_type=device_type, device_id=0, element_type=np.float32, shape=torchtrt_inputs[0].shape, buffer_ptr=torchtrt_inputs[0].data_ptr())
 io_binding.bind_input(name='boxes', device_type=device_type, device_id=0, element_type=np.float32, shape=torchtrt_inputs[1].shape, buffer_ptr=torchtrt_inputs[1].data_ptr())
-
+io_binding.bind_input(name='orig_hw', device_type=device_type, device_id=0, element_type=np.int32, shape=torchtrt_inputs[2].shape, buffer_ptr=torchtrt_inputs[2].data_ptr())
 io_binding.bind_output(name='low_res_masks', device_type=device_type, device_id=0, element_type=np.float32, shape=binded_low_res_masks.shape, buffer_ptr=binded_low_res_masks.data_ptr())
 io_binding.bind_output(name='iou_predictions', device_type=device_type, device_id=0, element_type=np.float32, shape=binded_iou_predictions.shape, buffer_ptr=binded_iou_predictions.data_ptr())
 with torch.no_grad():
@@ -266,7 +251,7 @@ with torch.no_grad():
     m_onnx: Measurement = timer_onnx.blocked_autorange(min_run_time=1)
 print(m_torch)
 print(m_onnx)
-masks, scores = postprocess_masks((binded_low_res_masks, binded_iou_predictions), predictor, input_image)
+masks, scores = postprocess_masks((binded_low_res_masks, binded_iou_predictions), input_image, boxes.shape[0])
 plt.figure(figsize=(10, 10))
 plt.imshow(input_image)
 for mask in masks:

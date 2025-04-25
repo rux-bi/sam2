@@ -10,3 +10,4 @@ outputs/*
 checkpoints/*.pt
 *.onnx
 *.engine
+assets/trt_cache/
